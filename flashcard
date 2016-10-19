@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+
+COL_GREEN="\e[1;32m"
+COL_NORMAL="\e[m"
+
+err() {
+    echo -e "$1" >&2
+    exit 1
+}
+
+usage() {
+    echo -e "Usage: ${0##*\/} [-k | -u] [-h] [device_node]" >&2
+}
+
+if [ $UID -ne 0 ]; then
+    err "only root can do that"
+fi
+
+OPTS=`getopt -o kuh? -l help -l kernel-only -l uboot-only -- "$@"`
+if [ "$?" != 0 ]; then
+    usage
+    exit 1
+fi
+
+eval set -- "$OPTS"
+
+while true; do
+    case "$1" in
+        -h|--help|?)
+            usage
+            exit 0
+            ;;
+        -k|--kernel-only)
+            UPLOAD_KERNEL_ONLY=1
+            shift
+            ;;
+        -u|--uboot-only)
+            UPLOAD_UBOOT_ONLY=1
+            shift
+            ;;
+        --)
+            shift; break;;
+    esac
+done
+
+if [ $# -eq 0 ]; then
+    echo -en "${COL_GREEN}Please input the device node of the card (e.g. /dev/sdb):${COL_NORMAL} "
+    read devnode
+else
+    devnode="$1"
+fi
+
+if [ `echo $devnode | grep "[0-9]$"` ] ; then
+    err "Error: please specify a whole disk instead of a partition."
+fi
+
+if ! [ -b $devnode ] ; then
+    err "Error: $devnode does not exist."
+fi
+
+upload_kernel() {
+    echo -e "\n${COL_GREEN}--${COL_NORMAL}"
+    echo -e "${COL_GREEN}Flashing uImage to ${devnode}...${COL_NORMAL}"
+    dd if=kernel/arch/arm/boot/uImage of=${devnode} bs=512 seek=2048 conv=fsync
+}
+
+upload_uboot() {
+    echo -e "\n${COL_GREEN}--${COL_NORMAL}"
+    echo -e "${COL_GREEN}Flashing u-boot.bin to ${devnode}...${COL_NORMAL}"
+    dd if=u-boot/u-boot.bin of=${devnode} bs=512 seek=2 skip=2 conv=fsync
+}
+
+ishdd=0
+for b in /dev/disk/by-id/* ; do
+    echo $b | grep HARDDISK >/dev/null || continue
+    ls -l $b | grep "${devnode##*/}$" >/dev/null && ishdd=1 && break
+done
+if [ $ishdd -ne "0" ] ; then
+    echo -en "${COL_GREEN}${devnode} is a hard drive. Continue [y/N]?${COL_NORMAL} "
+    read ans
+    echo $ans | grep -i "y" > /dev/null || err "Interrupted by user."
+fi
+
+echo -en "${COL_GREEN}Things on ${devnode} may probably be erased. Continue [y/N]?${COL_NORMAL} "
+read ans
+echo $ans | grep -i "y" > /dev/null || err "Interrupted by user."
+
+echo -e "\n${COL_GREEN}--${COL_NORMAL}"
+echo -e "${COL_GREEN}Unmounting all mounted partition on ${devnode}...${COL_NORMAL}"
+mount | grep "^$devnode" | awk '{print $3}' | while read mpoint ; do
+    umount $mpoint
+done
+
+if [ $UPLOAD_KERNEL_ONLY ]; then
+    upload_kernel
+    exit $?
+fi
+
+if [ $UPLOAD_UBOOT_ONLY ]; then
+    upload_uboot
+    exit $?
+fi
+
+echo -e "\n${COL_GREEN}--${COL_NORMAL}"
+echo -e "${COL_GREEN}Deleting partition table on ${devnode}...${COL_NORMAL}"
+dd if=/dev/zero of=${devnode} bs=512 count=4096 conv=fsync
+dd if=/dev/zero of=${devnode} bs=512 count=4096 conv=fsync seek=$((`blockdev --getsz ${devnode}` - 4096))
+partprobe
+
+upload_uboot
+
+upload_kernel
+
+echo -e "\n${COL_GREEN}--${COL_NORMAL}"
+echo -e "${COL_GREEN}Manipulating partiton table on ${devnode}...${COL_NORMAL}"
+(echo n; echo p; echo 1; echo 16384; echo; echo w;) | fdisk ${devnode}
+
+echo -e "\n${COL_GREEN}--${COL_NORMAL}"
+echo -e "${COL_GREEN}Creating filesystem on ${devnode}1...${COL_NORMAL}"
+mkfs.ext3 ${devnode}1
+
+echo -e "\n${COL_GREEN}--${COL_NORMAL}"
+echo -e "${COL_GREEN}Mounting ${devnode}1 on sdcard/...${COL_NORMAL}"
+mkdir sdcard 2>/dev/null
+mount ${devnode}1 sdcard
+
+echo -e "\n${COL_GREEN}--${COL_NORMAL}"
+echo -e "${COL_GREEN}Copying rootfs to sdcard/...${COL_NORMAL}"
+cd sdcard
+tar --numeric-owner -xzvf ../prebuilts/ubuntu/oneiric.tgz
+cd ..
+
+echo -e "\n${COL_GREEN}--${COL_NORMAL}"
+echo -e "${COL_GREEN}Unmounting sdcard/...${COL_NORMAL}"
+umount sdcard
+
+cd prebuilts/ubuntu/rootfs_add/
+./combine_rootfs.sh $1
+cd -
+
+echo -e "\n${COL_GREEN}Done.${COL_NORMAL}"
